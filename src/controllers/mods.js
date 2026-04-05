@@ -213,54 +213,99 @@ modsController.flags.detail = async function (req, res, next) {
 	}));
 };
 
-modsController.postQueue = async function (req, res, next) {
-	if (!req.loggedIn) {
-		return next();
-	}
-	const { id } = req.params;
-	const { cid } = req.query;
-	const page = parseInt(req.query.page, 10) || 1;
-	const postsPerPage = 20;
+function canViewQueuedPost(post, context) {
+	const { categoriesData, isAdmin, isGlobalMod, moderatedCids, uid } = context;
 
-	let postData = await posts.getQueuedPosts({ id: id });
-	let [isAdmin, isGlobalMod, moderatedCids, categoriesData, _privileges] = await Promise.all([
+	return post &&
+		(!categoriesData.selectedCids.length || categoriesData.selectedCids.includes(post.category.cid)) &&
+		(isAdmin || isGlobalMod || moderatedCids.includes(Number(post.category.cid)) || uid === post.user.uid);
+}
+
+function addPostQueuePrivileges(post, context) {
+	const { uid, isAdmin, isGlobalMod, moderatedCids } = context;
+	const isSelf = post.user.uid === uid;
+	post.canAccept = !isSelf && (isAdmin || isGlobalMod || !!moderatedCids.length);
+	post.canEdit = isSelf || isAdmin || isGlobalMod;
+	return post;
+}
+
+function buildPostQueueCrumbs(id, postData) {
+	const crumbs = [{ text: '[[pages:post-queue]]', url: id ? '/post-queue' : undefined }];
+
+	if (id && postData.length) {
+		const text = postData[0].data.tid ? '[[post-queue:reply]]' : '[[post-queue:topic]]';
+		crumbs.push({ text });
+	}
+
+	return crumbs;
+}
+
+function paginatePosts(postData, page, postsPerPage) {
+	const pageCount = Math.max(1, Math.ceil(postData.length / postsPerPage));
+	const start = (page - 1) * postsPerPage;
+	const stop = start + postsPerPage;
+
+	return {
+		pageCount,
+		posts: postData.slice(start, stop),
+	};
+}
+
+async function getPostQueueContext(req, cid) {
+	const [isAdmin, isGlobalMod, moderatedCids, categoriesData, privilegeSets] = await Promise.all([
 		user.isAdministrator(req.uid),
 		user.isGlobalModerator(req.uid),
 		user.getModeratedCids(req.uid),
 		helpers.getSelectedCategory(cid),
 		Promise.all(['global', 'admin'].map(async type => privileges[type].get(req.uid))),
 	]);
-	_privileges = { ..._privileges[0], ..._privileges[1] };
+
+	return {
+		isAdmin,
+		isGlobalMod,
+		moderatedCids,
+		categoriesData,
+		privileges: { ...privilegeSets[0], ...privilegeSets[1] },
+		uid: req.uid,
+	};
+}
+
+modsController.postQueue = async function (req, res, next) {
+	if (!req.loggedIn) {
+		return next();
+	}
+
+	const { id } = req.params;
+	const { cid } = req.query;
+	const page = parseInt(req.query.page, 10) || 1;
+	const postsPerPage = 20;
+
+	let postData = await posts.getQueuedPosts({ id });
+
+	const queueContext = await getPostQueueContext(req, cid);
+	const {
+		isAdmin,
+		isGlobalMod,
+		categoriesData,
+		privileges: mergedPrivileges,
+	} = queueContext;
 
 	postData = postData
-		.filter(p => p &&
-			(!categoriesData.selectedCids.length || categoriesData.selectedCids.includes(p.category.cid)) &&
-			(isAdmin || isGlobalMod || moderatedCids.includes(Number(p.category.cid)) || req.uid === p.user.uid))
-		.map((post) => {
-			const isSelf = post.user.uid === req.uid;
-			post.canAccept = !isSelf && (isAdmin || isGlobalMod || !!moderatedCids.length);
-			post.canEdit = isSelf || isAdmin || isGlobalMod;
-			return post;
-		});
+		.filter(post => canViewQueuedPost(post, queueContext))
+		.map(post => addPostQueuePrivileges(post, queueContext));
 
 	({ posts: postData } = await plugins.hooks.fire('filter:post-queue.get', {
 		posts: postData,
-		req: req,
+		req,
 	}));
 
-	const pageCount = Math.max(1, Math.ceil(postData.length / postsPerPage));
-	const start = (page - 1) * postsPerPage;
-	const stop = start + postsPerPage - 1;
-	postData = postData.slice(start, stop + 1);
-	const crumbs = [{ text: '[[pages:post-queue]]', url: id ? '/post-queue' : undefined }];
-	if (id && postData.length) {
-		const text = postData[0].data.tid ? '[[post-queue:reply]]' : '[[post-queue:topic]]';
-		crumbs.push({ text: text });
-	}
+	const { posts: paginatedPosts, pageCount } = paginatePosts(postData, page, postsPerPage);
+	const crumbs = buildPostQueueCrumbs(id, paginatedPosts);
+
 	res.render('post-queue', {
 		title: '[[pages:post-queue]]',
-		posts: postData,
-		isAdmin: isAdmin,
+		posts: paginatedPosts,
+		isAdmin,
 		canAccept: isAdmin || isGlobalMod,
 		...categoriesData,
 		allCategoriesUrl: `post-queue${helpers.buildQueryString(req.query, 'cid', '')}`,
@@ -268,6 +313,6 @@ modsController.postQueue = async function (req, res, next) {
 		breadcrumbs: helpers.buildBreadcrumbs(crumbs),
 		enabled: meta.config.postQueue,
 		singlePost: !!id,
-		privileges: _privileges,
+		privileges: mergedPrivileges,
 	});
 };
